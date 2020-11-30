@@ -1,0 +1,262 @@
+---
+title: "Analiza krwi pacjentów zarażonych COVID-19"
+author: "Paweł Bubak"
+date: "`r format(Sys.time(), '%d.%m.%Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+```
+
+```{r append_libs, include= FALSE}
+library(openxlsx)
+library(dplyr, warn.conflicts = FALSE)
+library(janitor)
+library(knitr)
+library(formattable)
+library(ggplot2)
+library(tibble)
+library(tidyr)
+library(plotly)
+library(purrr)
+library(broom)
+library(caret)
+```
+
+
+```{r colors, cache=TRUE}
+red = rgb(215/255, 48/255, 39/255)
+green = rgb(102/255, 189/255, 99/255)
+orange = rgb(253/255, 174/255, 97/255)
+```
+
+## Wprowadzenie
+Celem projektu jest analiza próbek krwi pacjentów chorych na COVID-19 w celu określenia głównych czynników ryzyka oraz potencjalnych markerów pozwalających przewidzieć szanse na przeżycie.
+
+Analizowane dane pochodzą od pacjentów przyjętych do szpitala Tongji w Wuhan (Chiny) i zawierają informacje o wynikach badań krwi. Zostały zebrane między 10. stycznia a 18. lutego 2020 roku. Więcej informacji na temat pozyskanych danych można znaleźć w artykule [Tan *et al* article](https://www.nature.com/articles/s42256-020-0180-7).
+
+W poniżej przedstawionej analizie danych można zauważyć, że na przeżywalność znaczący wpływ ma wiek pacjenta, a wyuczony klasyfikator wskazuje osoby zagrożone śmiercią bazując na atrybutach wśród których istotne miejsca zajmują atrybuty wskazane przez autorów wcześniej wspomnianego artykułu.
+
+```{r load_data, cache=TRUE}
+# Load data
+df_oryginal <- read.xlsx(
+  "http://www.cs.put.poznan.pl/dbrzezinski/teaching/zed/wuhan_blood_sample_data_Jan_Feb_2020.xlsx",
+  fillMergedCells = TRUE,
+  check.names = TRUE,
+  sep.names = "_")
+# Clean parameter names
+df_samples <- tibble(df_oryginal) %>% 
+  clean_names() %>%
+  rename(survived = outcome) %>%
+  mutate(survived = if_else(survived == 0, 1, 0))
+# Fill in blank values based on previous / later test results for each patient
+df_samples <- df_samples %>% 
+  group_by(patient_id) %>%
+  fill(everything(), .direction = "downup") %>%
+  ungroup()
+# Fill in remaining blank values with the median
+df_samples <- df_samples %>%
+  mutate(re_date = if_else(is.na(re_date), admission_time, re_date)) %>%
+  mutate_all(~if_else(is.na(.), median(., na.rm = TRUE), .))
+# Parse and map values
+df_samples <- df_samples %>%
+  mutate(re_date = as.POSIXct(openxlsx::convertToDateTime(re_date))) %>%
+  mutate(survived = factor(if_else(survived == 1, 'yes', 'no'))) %>%
+  mutate(gender = factor(if_else(gender == 1, 'male', 'female')))
+# get all patients from dataset
+df_patients <- df_samples %>%
+  select(patient_id, gender, age, admission_time, discharge_time, survived) %>%
+  distinct() %>%
+  mutate(admission_time = as.POSIXct(openxlsx::convertToDateTime(admission_time))) %>%
+  mutate(discharge_time = as.POSIXct(openxlsx::convertToDateTime(discharge_time)))
+```
+
+## Omówienie zbioru danych
+### Oryginalny zbiór danych
+Oryginalny zbiór danych składa się z `r nrow(df_samples)` wpisów przechowujących w poszczególnych kolumnach wyniki przeprowadzonych badań na próbce krwi. Wpisy zawierają wyniki tylko przeprowadzonych badań na danej próbce (w kolumnach odpowiadający nieprzeprowadzonym badaniom znajdują się wartości puste). Badane próbki krwi dotyczą `r nrow(df_patients)` pacjentów.
+```{r oryginal_dataset_summary}
+kable(summary(df_oryginal))
+```
+
+### Wyczyszczony zbiór danych
+W celu przeprowadzena analizy uzupełniono wartości w zbiorze danych. Dla każdego pacjenta uzupełniono puste wartości na podstawie wcześniejszych/późniejszych wyników badań. Jeżeli w zbiorze danych nadal występowały wartości puste, to uzupełniono je na podstawie mediany całego zbioru danych. W zbiorze pojawiły się również wartości puste w kolumnie odpowiadającej dacie rejestracji próbki krwi — wartości te uzupełniono na podstawie daty przyjęcia pacjenta do szpitala.
+```{r cleaned_dataset_summary}
+kable(summary(df_samples))
+```
+
+### Charakterystyka pacjentów
+```{r patient_summary}
+kable(summary(df_patients %>% select(admission_time, discharge_time, age, gender, survived)))
+```
+
+Pacjenci przyjmowani byli do szpitala między 10. stycznia a 17. lutego 2020 roku. Wiek pacjentów wachał się między 18 a 95 lat, a 75% z nich było w wieku powyżej 45 lat. W badanym zbiorze danych przeważała liczba mężczyzn (59,73%), a przeżywalność pacjentów wynosiła 56,3%.
+
+### Analiza płci pacjentów
+```{r gender_analise}
+women_count <- df_patients %>% filter(gender == 'female') %>% count() %>% pull()
+survived_women_count <- df_patients %>% filter(gender == 'female', survived == 'yes') %>% count() %>% pull()
+men_count <- df_patients %>% filter(gender == 'male') %>% count() %>% pull()
+survived_men_count <- df_patients %>% filter(gender == 'male', survived == 'yes') %>% count() %>% pull()
+```
+
+#### Liczba pacjentów w podziale na płeć
+```{r patients_by_gender}
+by_gender <- df_patients %>% 
+  mutate(gender = factor(if_else(gender == 'male', "Mężczyzna", "Kobieta"))) %>%
+  group_by(gender) %>% 
+  summarize("count" = n()) %>%
+  rename("Płeć" = "gender") %>%
+  rename("Liczba" = "count")
+
+formattable(by_gender, align = c("l", "l"))
+```
+
+#### Przeżywalność ze względu płeć
+Przeżywalność w grupie kobiet wynosi `r round(survived_women_count*100/women_count, 2)`%.\
+Przeżywalność w grupie mężczyzn wynosi `r round(survived_men_count*100/men_count, 2)`%.
+```{r survived_by_gender}
+ggplot(df_patients, aes(gender, fill = survived)) +
+  geom_bar(stat = "count", position = 'dodge') +
+  labs(x = "Płeć", y = "Liczba pacjentów", fill = "Przeżył") +
+  scale_x_discrete(labels = c("male" = "Mężczyźni", "female" = "Kobiety")) + 
+  scale_fill_manual(labels = c("no" = "Nie", "yes" = "Tak"), values = c("no" = red, "yes" = green)) +
+  theme_classic()
+```
+
+### Analiza wieku pacjentów
+#### Liczba pacjentów w podziale na wiek
+```{r patients_by_age}
+ggplot(df_patients, aes(age)) +
+  geom_bar(stat = "count", fill = orange) +
+  labs(x = "Wiek", y = "Liczba pacjentów") +
+  scale_x_continuous(breaks = seq(floor(min(df_patients$age)/5)*5, ceiling(max(df_patients$age)/5)*5, by = 5)) +
+  theme_classic()
+```
+
+#### Przeżywalność ze względu wiek
+Na wykresie poniżej można zauważyć, że przeżywalność wzrast wraz z wiekiem. W większości przypadków powyżej 65 roku życia przeżywalność wynosi mniej niż 50%.
+```{r survived_by_age}
+ggplot(df_patients, aes(age, fill = survived)) +
+  geom_bar(stat = "count", position = 'dodge') +
+  labs(x = "Wiek", y = "Liczba pacjentów", fill = "Przeżył") +
+  scale_x_continuous(breaks = seq(floor(min(df_patients$age)/5)*5, ceiling(max(df_patients$age)/5)*5, by = 5)) +
+  scale_fill_manual(labels = c("no" = "Nie", "yes" = "Tak"), values = c("no" = red, "yes" = green)) +
+  theme_classic()
+```
+
+## Korelacja między zmiennymi
+Na wykresie  poniżejprzedstawiono wartości współczynnika korelacji Pearsona między wszystkimi atrybutami w zbiorze.
+```{r correlation_all_attributes}
+df_correlation <- df_samples %>% 
+  select(-patient_id, -re_date, -admission_time, -discharge_time) %>%
+  mutate_if(is.character, as.factor) %>%
+  mutate_if(is.factor, as.numeric)
+names(df_correlation) <- abbreviate(names(df_correlation), minlength = 7)
+correlation <- cor(df_correlation)
+df_correlation = data.frame(round(correlation,2)) %>% 
+  rownames_to_column() %>%
+  pivot_longer(-rowname, names_to="colname")
+plot <- ggplot(df_correlation, aes(colname, rowname, fill=value)) + 
+  geom_tile() +
+  scale_fill_gradient2() + 
+  theme(axis.text.x=element_text(angle = 90, hjust = 0))
+ggplotly(plot)
+```
+
+Poniższa tabela zawiera 10 najbardziej skorelowanych atrybutów z przeżywalnością w badanym zbiorze danych.
+```{r correlation}
+correlations <- df_samples %>%
+  select(-patient_id, -re_date, -admission_time, -discharge_time) %>%
+  mutate(survived = as.numeric(survived == 'yes')) %>%
+  mutate(gender = as.numeric(gender == 'male')) %>%
+  pivot_longer(!survived, names_to="attribute", values_to="value") %>%
+  filter(!is.na(value)) %>%
+  nest(data = c(value, survived)) %>%
+  mutate(correlation = map(data, ~tidy(cor.test(.x$value, .x$survived)))) %>%
+  unnest(correlation) %>%
+  mutate(estimate = round(estimate, 2)) %>%
+  mutate(p.value = round(p.value, 2)) %>%
+  mutate(conf.low = round(conf.low, 2)) %>%
+  mutate(conf.high = round(conf.high, 2)) %>%
+  select(attribute, estimate, p.value, conf.low, conf.high) %>%
+  rename("Atrybut" = "attribute") %>%
+  arrange(desc(abs(estimate))) %>%
+  head(10)
+formattable(correlations)
+```
+
+## Klasyfikator
+W celu wskazania osób zagrożonych śmiercią wyszkolono klasyfikator Random Forest. Klasyfikator ten podczas uczenia optymalizował liczbę parametrów, na podstawie której przeprowadzał klasyfikację. Wartość parametru określająca liczbę drzew w lesie wynosiła 30. Do trenowania klasyfikatora wykorzystano walidację krzyżową (podział zbioru na 10 części) z pięcioma powtórzeniami.
+### Przygotowanie danych
+Do uczenia klasyfikatora zbiór danych został zredukowany do ostatniego wpisu zawierającego wyniki badań przeprowadzonych na próbce krwi każdego pacjenta. Dodatkowo ze zbioru danych usunięto kolumny przechowujące informację o id pacjenta oraz daty zarejestrowania próbki, przyjęcia pacjenta do szpitala i jego wypisania.
+```{r prepare_data}
+patients <- df_samples %>% 
+  group_by(patient_id) %>% 
+  summarise_all(last) %>% 
+  ungroup() %>%
+  select(-patient_id, -re_date, -admission_time, -discharge_time)
+```
+
+### Wyniki uczenia klasyfikatora
+#### Uczenie klasyfikatora
+```{r prepare_classifier}
+# split dataset
+set.seed(23)
+training_filter <- createDataPartition(y = patients$survived, p = .7, list = FALSE)
+training <- patients[ training_filter[,1],]
+testing  <- patients[-training_filter[,1],]
+# learning scheme
+rf_grid <- expand.grid(mtry = 10:30)
+set.seed(23)
+ctrl <- trainControl(method = "repeatedcv", 
+    summaryFunction = twoClassSummary,
+    classProbs = TRUE,
+    number = 10, 
+    repeats = 5)
+# learning
+set.seed(23)
+fit <- train(survived ~ .,
+             data = training,
+             method = "rf",
+             metric = "ROC",
+             preProc = c("center", "scale"),
+             trControl = ctrl,
+             tuneGrid = rf_grid,
+             ntree = 30)
+fit
+```
+
+#### Weryfikacja na zbiorze testowym
+Na podstawie poniżej zamieszonych wyników można założyć, że klasyfikator spełnia swoje przeznaczenie, a jego dokładność wynosi 95%.
+```{r testing}
+set.seed(23)
+predict <- predict(fit, newdata = testing)
+confusionMatrix(data = predict, testing$survived)
+```
+
+#### Analiza ważności atrybutów
+Poniżej zamieszczono tablę tabelę, w której znajduje się 10 najbardziej znaczących podczas klasyfikacji atrybutów. Można zauważyć, że wśród 5 najbardziej znaczących atrybutów znajdują się atrybuty wskazane przez autorów artykułu. 
+```{r}
+vi <- varImp(fit, scale=FALSE)
+kable(vi$importance %>% arrange(desc(Overall)) %>% head(10))
+```
+
+## Użyte pakiety
+* openxlsx
+* dplyr
+* janitor
+* knitr
+* formattable
+* ggplot2
+* tibble
+* tidyr
+* plotly
+* purrr
+* broom
+* caret
