@@ -193,6 +193,7 @@ formattable(correlations)
 
 ## Klasyfikator
 W celu wskazania osób zagrożonych śmiercią wyszkolono klasyfikator Random Forest. Klasyfikator ten podczas uczenia optymalizował liczbę parametrów, na podstawie której przeprowadzał klasyfikację. Wartość parametru określająca liczbę drzew w lesie wynosiła 30. Do trenowania klasyfikatora wykorzystano walidację krzyżową (podział zbioru na 10 części) z pięcioma powtórzeniami.
+
 ### Przygotowanie danych
 Do uczenia klasyfikatora zbiór danych został zredukowany do ostatniego wpisu zawierającego wyniki badań przeprowadzonych na próbce krwi każdego pacjenta. Dodatkowo ze zbioru danych usunięto kolumny przechowujące informację o id pacjenta oraz daty zarejestrowania próbki, przyjęcia pacjenta do szpitala i jego wypisania.
 ```{r prepare_data}
